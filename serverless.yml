@@ -1,0 +1,182 @@
+service: mindstep
+frameworkVersion: '3'
+
+plugins:
+  - serverless-iam-roles-per-function
+  - serverless-offline
+
+custom:
+  sentryDSN: ''
+  serverless-iam-roles-per-function:
+    defaultInherit: true
+  DynamodbTableName: 'SuperHero'
+  S3Bucket: mindset-Notsh-test-superhero-${opt:stage}-bucket
+  S3BucketArn: arn:aws:s3:::${self:custom.S3Bucket}
+
+provider:
+  name: aws
+  runtime: nodejs18.x
+  httpApi:
+    metrics: true
+    authorizers:
+      customAuthorizer:
+        type: request
+        functionName: fakeAuthoriser
+        enableSimpleResponses: true
+  s3:
+    superHeroBucket:
+      name: ${self:custom.S3Bucket}
+  logs:
+    httpApi: true
+  tracing:
+    lambda: true
+  timeout: 60
+  tags:
+    service: mindstep
+    environment: ${opt:stage}
+  stackTags:
+    service: mindstep
+    environment: ${opt:stage}
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - "logs:*"
+          Resource: '*'
+        - Effect: Allow
+          Action: cloudwatch:PutMetricData
+          Resource: '*'
+        - Effect: Allow
+          Action:
+            - xray:PutTraceSegments
+            - xray:PutTelemetryRecords
+          Resource: '*'
+  environment:
+    STAGE: ${opt:stage}
+    SENTRY_DSN: ${self:custom.sentryDSN}
+
+    # Dynamodb
+    DynamodbTableName: ${self:custom.DynamodbTableName}
+
+    # S3
+    SUPERHEROBUCKET: ${self:custom.S3Bucket}
+
+    # Gender Weighting
+    MALE_WEIGHTING: 5
+    FEMALE_WEIGHTING: 8
+
+functions:
+  fakeAuthoriser:
+    description: Custom Auth that returns a basic User UUID to be used as a Mock User ID.
+    handler: fakeAuthoriser/index.handler
+
+  superHero:
+    description: Takes the Super Hero Score and saves it DynamoDB
+    handler: superhero/index.handler
+    timeout: 10
+    tracing: Active
+    iamRoleStatementsInherit: true
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - 'dynamodb:PutItem'
+          - 'dynamodb:Query'
+        Resource:
+          - !GetAtt SuperHero.Arn
+    events:
+      - httpApi:
+          method: POST
+          path: /superhero
+          authorizer:
+            name: customAuthorizer
+
+  demask:
+    description: Gets all newly saved Super Hero Scores and enriches the user to have all the other info.
+    handler: demask/index.handler
+    tracing: Active
+    iamRoleStatementsInherit: true
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - 'dynamodb:PutItem'
+          - 'dynamodb:GetItem'
+          - 'dynamodb:Query'
+        Resource:
+          - !GetAtt SuperHero.Arn
+      - Effect: Allow
+        Action:
+          - 'dynamodb:DescribeStream'
+          - 'dynamodb:GetRecords'
+          - 'dynamodb:GetShardIterator'
+          - 'dynamodb:ListStreams'
+        Resource:
+          - !GetAtt SuperHero.StreamArn
+      - Effect: Allow
+        Action:
+          - s3:GetObject
+          - s3:DeleteObject
+          - s3:ListBucket
+          - s3:PutObject
+        Resource:
+          - ${self:custom.S3BucketArn}
+          - '${self:custom.S3BucketArn}/*'
+    events:
+      - stream:
+          type: dynamodb
+          arn: !GetAtt SuperHero.StreamArn
+          batchSize: 1
+          filterPatterns:
+            - dynamodb:
+                Keys:
+                  SK:
+                    S:
+                      - superhero#score
+
+
+  revealSuperHero:
+    description: If you have a user ID you can send that to the endpoint to get the need info.
+    handler: revealSuperHero/index.handler
+    timeout: 10
+    tracing: Active
+    iamRoleStatementsInherit: true
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - 'dynamodb:GetItem'
+          - 'dynamodb:Query'
+        Resource:
+          - !GetAtt SuperHero.Arn
+    events:
+      - httpApi:
+          method: GET
+          path: /reveal-superhero/{userId}
+          authorizer:
+            name: customAuthorizer
+
+
+resources:
+  Resources:
+    SuperHero:
+      Type: 'AWS::DynamoDB::Table'
+      Properties:
+        TableName: ${self:custom.DynamodbTableName}
+        AttributeDefinitions:
+          - AttributeName: PK
+            AttributeType: S
+          - AttributeName: SK
+            AttributeType: S
+        KeySchema:
+          - AttributeName: PK
+            KeyType: "HASH"
+          - AttributeName: SK
+            KeyType: "RANGE"
+        StreamSpecification:
+          StreamViewType: "NEW_AND_OLD_IMAGES"
+        ProvisionedThroughput:
+          ReadCapacityUnits: 1
+          WriteCapacityUnits: 1
+    SuperHeroBucket:
+      Type: 'AWS::S3::Bucket'
+      Properties:
+        BucketName: ${self:custom.S3Bucket}
